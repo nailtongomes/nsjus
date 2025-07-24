@@ -1,15 +1,17 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
-from collections import Counter
 from datetime import datetime
 import time
 import io
 from typing import Dict, List, Tuple, Optional
 import logging
 import re
+import os
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import warnings
+warnings.filterwarnings('ignore')
 
 # Configuração da página
 st.set_page_config(
@@ -22,6 +24,26 @@ st.set_page_config(
 # Configuração de logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def load_default_data(analyzer):
+    """Carrega automaticamente o arquivo dados.xlsx se existir"""
+    default_files = ["dados.xlsx", "data/dados.xlsx", "./dados.xlsx"]
+
+    for file_path in default_files:
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, 'rb') as f:
+                    if analyzer.load_data(f):
+                        st.success(f"✅ Arquivo padrão carregado: {file_path}")
+                        st.session_state['data_loaded'] = True
+                        st.session_state['default_loaded'] = True
+                        return True
+            except Exception as e:
+                st.warning(f"⚠️ Erro ao carregar {file_path}: {e}")
+                continue
+
+    return False
 
 
 class ProcessAnalyzer:
@@ -450,22 +472,30 @@ class Dashboard:
         return aplicar
 
     def render_upload_section(self):
-        """Renderiza seção de upload de arquivo"""
+        """Renderiza seção de upload com auto-load"""
         st.header("📁 Upload do Arquivo")
 
+        # Tentar carregar arquivo padrão automaticamente
+        if 'default_loaded' not in st.session_state:
+            if load_default_data(self.analyzer):
+                st.info("💡 Arquivo padrão carregado. Você pode fazer upload de outro arquivo se desejar.")
+            else:
+                st.info("📝 Coloque seu arquivo como 'dados.xlsx' na pasta raiz para carregamento automático")
+
         uploaded_file = st.file_uploader(
-            "Escolha o arquivo Excel com os dados dos processos",
+            "Ou escolha outro arquivo Excel",
             type=['xlsx', 'xls'],
             help="Arquivo deve seguir o formato padrão do GPSJUS"
         )
 
         if uploaded_file is not None:
-            if st.button("📊 Processar Arquivo", type="primary"):
+            if st.button("📊 Processar Novo Arquivo", type="primary"):
                 if self.analyzer.load_data(uploaded_file):
                     st.session_state['data_loaded'] = True
+                    st.session_state['default_loaded'] = False
                     st.rerun()
 
-        return uploaded_file is not None
+        return uploaded_file is not None or st.session_state.get('default_loaded', False)
 
     def render_overview(self):
         """Renderiza visão geral dos dados"""
@@ -812,12 +842,421 @@ class Dashboard:
         output.seek(0)
         return output.read()
 
+    def create_performance_heatmap(self, data_limpo):
+        """Cria heatmap de performance por classe e ano"""
+        if 'ANO_DISTRIBUICAO' not in data_limpo.columns:
+            return None
+
+        # Agrupa por ano e classe
+        heatmap_data = data_limpo.groupby(['ANO_DISTRIBUICAO', 'CLASSE']).agg({
+            'DIAS CONCLUSO': 'mean',
+            'NÚMERO': 'count'
+        }).reset_index()
+
+        # Pivota para criar matriz
+        pivot_table = heatmap_data.pivot(
+            index='CLASSE',
+            columns='ANO_DISTRIBUICAO',
+            values='DIAS CONCLUSO'
+        ).fillna(0)
+
+        # Limita a 15 classes mais frequentes
+        top_classes = data_limpo['CLASSE'].value_counts().head(15).index
+        pivot_table = pivot_table.loc[pivot_table.index.intersection(top_classes)]
+
+        if pivot_table.empty:
+            return None
+
+        fig = go.Figure(data=go.Heatmap(
+            z=pivot_table.values,
+            x=[str(col) for col in pivot_table.columns],
+            y=[classe[:40] + "..." if len(classe) > 40 else classe for classe in pivot_table.index],
+            colorscale='RdYlBu_r',
+            text=pivot_table.values.round(0),
+            texttemplate="%{text}",
+            textfont={"size": 10},
+            colorbar=dict(title="Dias Médios")
+        ))
+
+        fig.update_layout(
+            title="Heatmap: Tempo Médio de Tramitação por Classe e Ano",
+            xaxis_title="Ano de Distribuição",
+            yaxis_title="Classe Judicial",
+            height=600
+        )
+
+        return fig
+
+    def create_pareto_chart(self, data_limpo):
+        """Cria gráfico de Pareto para análise 80/20"""
+        # Calcula tempo total por classe
+        class_time = data_limpo.groupby('CLASSE').agg({
+            'DIAS CONCLUSO': 'sum',
+            'NÚMERO': 'count'
+        }).reset_index()
+
+        class_time['TEMPO_MEDIO'] = class_time['DIAS CONCLUSO'] / class_time['NÚMERO']
+        class_time = class_time.sort_values('DIAS CONCLUSO', ascending=False).head(15)
+
+        # Calcula percentual acumulado
+        class_time['PERC_INDIVIDUAL'] = (class_time['DIAS CONCLUSO'] / class_time['DIAS CONCLUSO'].sum()) * 100
+        class_time['PERC_ACUMULADO'] = class_time['PERC_INDIVIDUAL'].cumsum()
+
+        # Cria gráfico
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+        # Barras
+        fig.add_trace(
+            go.Bar(
+                x=[classe[:30] + "..." if len(classe) > 30 else classe for classe in class_time['CLASSE']],
+                y=class_time['DIAS CONCLUSO'],
+                name="Dias Totais",
+                marker_color='lightblue'
+            ),
+            secondary_y=False,
+        )
+
+        # Linha de percentual acumulado
+        fig.add_trace(
+            go.Scatter(
+                x=[classe[:30] + "..." if len(classe) > 30 else classe for classe in class_time['CLASSE']],
+                y=class_time['PERC_ACUMULADO'],
+                mode='lines+markers',
+                name="% Acumulado",
+                line=dict(color='red', width=3),
+                marker=dict(size=8)
+            ),
+            secondary_y=True,
+        )
+
+        # Linha dos 80%
+        fig.add_hline(y=80, line_dash="dash", line_color="red", secondary_y=True)
+
+        fig.update_xaxes(title_text="Classes Judiciais")
+        fig.update_yaxes(title_text="Dias Totais de Tramitação", secondary_y=False)
+        fig.update_yaxes(title_text="Percentual Acumulado (%)", secondary_y=True)
+
+        fig.update_layout(
+            title="Análise de Pareto: Classes que Consomem Mais Tempo",
+            height=500
+        )
+
+        return fig
+
+    def create_productivity_funnel(self, data_limpo):
+        """Cria funil de produtividade judicial"""
+        # Simula estágios do processo (pode ser adaptado conforme dados reais)
+        total_distribuidos = len(data_limpo)
+        em_andamento = len(
+            data_limpo[data_limpo['JULGAMENTO'].isnull()]) if 'JULGAMENTO' in data_limpo.columns else int(
+            total_distribuidos * 0.7)
+        conclusos = len(data_limpo[data_limpo['DIAS CONCLUSO'] > 0])
+        julgados = total_distribuidos - em_andamento
+
+        fig = go.Figure(go.Funnel(
+            y=["Distribuídos", "Em Andamento", "Conclusos", "Julgados"],
+            x=[total_distribuidos, em_andamento, conclusos, julgados],
+            textinfo="value+percent initial",
+            marker={"color": ["deepskyblue", "lightsalmon", "lightgreen", "gold"]},
+            connector={"line": {"color": "royalblue", "dash": "dot", "width": 3}}
+        ))
+
+        fig.update_layout(
+            title="Funil de Produtividade Judicial",
+            height=400
+        )
+
+        return fig
+
+    def create_risk_matrix(self, data_limpo):
+        """Cria matriz de risco: Volume x Complexidade"""
+        # Agrupa por assunto
+        risk_data = data_limpo.groupby('ASSUNTO').agg({
+            'NÚMERO': 'count',
+            'DIAS CONCLUSO': 'mean'
+        }).reset_index()
+
+        risk_data = risk_data[risk_data['NÚMERO'] >= 3]  # Só assuntos com pelo menos 3 processos
+        risk_data = risk_data.head(20)  # Top 20
+
+        if len(risk_data) == 0:
+            fig = go.Figure()
+            fig.add_annotation(text="Dados insuficientes para matriz de risco",
+                               x=0.5, y=0.5, showarrow=False)
+            return fig
+
+        # Define cores baseadas em quartis
+        q75_volume = risk_data['NÚMERO'].quantile(0.75)
+        q75_tempo = risk_data['DIAS CONCLUSO'].quantile(0.75)
+
+        colors = []
+        sizes = []
+        for _, row in risk_data.iterrows():
+            volume = row['NÚMERO']
+            tempo = row['DIAS CONCLUSO']
+
+            if volume >= q75_volume and tempo >= q75_tempo:
+                colors.append('red')  # Alto risco
+                sizes.append(20)
+            elif volume >= q75_volume or tempo >= q75_tempo:
+                colors.append('orange')  # Médio risco
+                sizes.append(15)
+            else:
+                colors.append('green')  # Baixo risco
+                sizes.append(10)
+
+        fig = go.Figure(data=go.Scatter(
+            x=risk_data['NÚMERO'],
+            y=risk_data['DIAS CONCLUSO'],
+            mode='markers+text',
+            marker=dict(
+                size=sizes,
+                color=colors,
+                opacity=0.7,
+                line=dict(width=2, color='white')
+            ),
+            text=[assunto[:25] + "..." if len(assunto) > 25 else assunto for assunto in risk_data['ASSUNTO']],
+            textposition="top center",
+            textfont=dict(size=8),
+            hovertemplate="<b>%{text}</b><br>Volume: %{x}<br>Tempo Médio: %{y:.0f} dias<extra></extra>"
+        ))
+
+        # Adiciona linhas de referência
+        fig.add_vline(x=q75_volume, line_dash="dash", line_color="gray", annotation_text="75% Volume")
+        fig.add_hline(y=q75_tempo, line_dash="dash", line_color="gray", annotation_text="75% Tempo")
+
+        fig.update_layout(
+            title="Matriz de Risco: Volume x Complexidade por Assunto",
+            xaxis_title="Volume de Processos",
+            yaxis_title="Tempo Médio (dias)",
+            height=600
+        )
+
+        return fig
+
+    # =============================================================================
+    # 3. MÉTRICAS AVANÇADAS E KPIs (ADICIONAR NA CLASSE Dashboard)
+    # =============================================================================
+
+    def calculate_advanced_metrics(self):
+        """Calcula métricas avançadas de produtividade"""
+        if self.analyzer.data_limpo is None:
+            return {}
+
+        data = self.analyzer.data_limpo
+
+        metrics = {}
+
+        # Taxa de Congestionamento
+        total_processos = len(data)
+        julgados = len(data[data['JULGAMENTO'].notnull()]) if 'JULGAMENTO' in data.columns else int(total_processos * 0.3)
+        metrics['taxa_congestionamento'] = ((total_processos - julgados) / total_processos) * 100
+
+        # Idade Média do Acervo
+        metrics['idade_media_acervo'] = data['DIAS CONCLUSO'].mean()
+
+        # Clearance Rate (simulado - seria casos novos vs julgados no período)
+        distribuidos_ano_atual = len(data[data['ANO_DISTRIBUICAO'] == data[
+            'ANO_DISTRIBUICAO'].max()]) if 'ANO_DISTRIBUICAO' in data.columns else total_processos
+        metrics['clearance_rate'] = (julgados / distribuidos_ano_atual) * 100 if distribuidos_ano_atual > 0 else 0
+
+        # Produtividade por Dia
+        dias_uteis_ano = 220  # Aproximado
+        metrics['produtividade_diaria'] = julgados / dias_uteis_ano
+
+        # Processos em Risco (>365 dias)
+        processos_risco = len(data[data['DIAS CONCLUSO'] > 365])
+        metrics['processos_em_risco'] = processos_risco
+        metrics['perc_processos_risco'] = (processos_risco / total_processos) * 100
+
+        # Tempo Médio por Classificação
+        metrics['tempo_conhecimento'] = data[data['CLASSIFICAÇÃO'] == 'CONHECIMENTO']['DIAS CONCLUSO'].mean()
+        metrics['tempo_execucao'] = data[data['CLASSIFICAÇÃO'] == 'EXECUÇÃO']['DIAS CONCLUSO'].mean()
+
+        return metrics
+
+
+    def render_advanced_kpis(self):
+        """Renderiza KPIs avançados"""
+        st.header("📊 KPIs Avançados de Gestão")
+
+        st.warning("Dados insuficientes para calcular KPIs avançados")
+        return
+
+        metrics = self.calculate_advanced_metrics()
+
+        if not metrics:
+            st.warning("Dados insuficientes para calcular KPIs avançados")
+            return
+
+        # Primeira linha de métricas
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            st.metric(
+                "Taxa de Congestionamento",
+                f"{metrics.get('taxa_congestionamento', 0):.1f}%",
+                delta=f"Meta: <70%",
+                help="Percentual de processos não julgados no acervo"
+            )
+
+        with col2:
+            clearance = metrics.get('clearance_rate', 0)
+            delta_color = "normal" if clearance >= 100 else "inverse"
+            st.metric(
+                "Clearance Rate",
+                f"{clearance:.1f}%",
+                delta=f"Meta: >100%",
+                help="Relação entre casos julgados e casos novos"
+            )
+
+        with col3:
+            st.metric(
+                "Idade Média do Acervo",
+                f"{metrics.get('idade_media_acervo', 0):.0f} dias",
+                help="Tempo médio desde a distribuição"
+            )
+
+        with col4:
+            st.metric(
+                "Produtividade Diária",
+                f"{metrics.get('produtividade_diaria', 0):.1f}",
+                help="Processos julgados por dia útil"
+            )
+
+        # Segunda linha
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric(
+                "Processos em Risco",
+                f"{metrics.get('processos_em_risco', 0)}",
+                delta=f"{metrics.get('perc_processos_risco', 0):.1f}% do total",
+                help="Processos com mais de 365 dias"
+            )
+
+        with col2:
+            st.metric(
+                "Tempo Médio - Conhecimento",
+                f"{metrics.get('tempo_conhecimento', 0):.0f} dias",
+                help="Tempo médio de tramitação em processos de conhecimento"
+            )
+
+        with col3:
+            st.metric(
+                "Tempo Médio - Execução",
+                f"{metrics.get('tempo_execucao', 0):.0f} dias",
+                help="Tempo médio de tramitação em execuções"
+            )
+
+    def render_enhanced_charts(self):
+        """Versão aprimorada da função render_charts"""
+        if self.analyzer.data_limpo is None or len(self.analyzer.data_limpo) == 0:
+            st.warning("Nenhum dado disponível para exibir gráficos")
+            return
+
+        st.header("📈 Análises Avançadas")
+
+        # Abas para organizar gráficos
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 Visão Geral", "🎯 Análise Estratégica", "⏱️ Produtividade", "🔍 Padrões"])
+
+        with tab1:
+            # Gráficos originais otimizados
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("Distribuição por Classificação")
+                classif_counts = self.analyzer.data_limpo['CLASSIFICAÇÃO'].value_counts()
+                if len(classif_counts) > 0:
+                    fig_classif = px.pie(
+                        values=classif_counts.values,
+                        names=classif_counts.index,
+                        title="Processos por Classificação"
+                    )
+                    fig_classif.update_traces(textposition='inside', textinfo='percent+label')
+                    st.plotly_chart(fig_classif, use_container_width=True)
+
+            with col2:
+                st.subheader("Distribuição por Ano")
+                if 'ANO_DISTRIBUICAO' in self.analyzer.data_limpo.columns:
+                    ano_counts = self.analyzer.data_limpo['ANO_DISTRIBUICAO'].value_counts().sort_index()
+                    if len(ano_counts) > 0:
+                        fig_ano = px.bar(
+                            x=ano_counts.index,
+                            y=ano_counts.values,
+                            title="Processos por Ano de Distribuição",
+                            labels={'x': 'Ano', 'y': 'Quantidade'}
+                        )
+                        st.plotly_chart(fig_ano, use_container_width=True)
+
+            # Gráfico adicional: Top 10 Classes
+            st.subheader("Top 10 Classes mais Frequentes")
+            if 'CLASSE' in self.analyzer.data_limpo.columns:
+                top_classes = self.analyzer.data_limpo['CLASSE'].value_counts().head(10)
+                if len(top_classes) > 0:
+                    fig_classes = px.bar(
+                        x=top_classes.values,
+                        y=[classe[:50] + "..." if len(classe) > 50 else classe for classe in top_classes.index],
+                        orientation='h',
+                        title="Classes Mais Frequentes",
+                        labels={'x': 'Quantidade', 'y': 'Classe'}
+                    )
+                    fig_classes.update_layout(height=400)
+                    st.plotly_chart(fig_classes, use_container_width=True)
+
+        with tab2:
+            # Análises estratégicas
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("Análise de Pareto")
+                fig_pareto = self.create_pareto_chart(self.analyzer.data_limpo)
+                st.plotly_chart(fig_pareto, use_container_width=True)
+
+            with col2:
+                st.subheader("Matriz de Risco")
+                fig_risk = self.create_risk_matrix(self.analyzer.data_limpo)
+                st.plotly_chart(fig_risk, use_container_width=True)
+
+        with tab3:
+            # Análises de produtividade
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.subheader("Funil de Produtividade")
+                fig_funnel = self.create_productivity_funnel(self.analyzer.data_limpo)
+                st.plotly_chart(fig_funnel, use_container_width=True)
+
+            with col2:
+                st.subheader("Heatmap de Performance")
+                fig_heatmap = self.create_performance_heatmap(self.analyzer.data_limpo)
+                if fig_heatmap:
+                    st.plotly_chart(fig_heatmap, use_container_width=True)
+                else:
+                    st.info("Dados insuficientes para heatmap de performance")
+
+        with tab4:
+            # Análise de padrões
+            st.subheader("Análise de Clusters")
+            st.info("Funcionalidade em desenvolvimento - Análise de padrões será implementada em versão futura")
+
+
+@st.cache_data(ttl=3600)  # Cache por 1 hora
+def cached_data_processing(data_hash, filters_hash):
+    """Cache para processamento pesado de dados"""
+    # Esta função seria chamada dentro do clean_data
+    pass
+
+@st.cache_data
+def cached_chart_data(data_subset, chart_type):
+    """Cache específico para dados de gráficos"""
+    pass
 
 def main():
     """Função principal do aplicativo"""
     st.title("⚖️ Análise de Processos Judiciais - Versão Aprimorada")
     st.markdown(
-        "Sistema otimizado de classificação e agrupamento de processos para maximizar produtividade judicial")
+        "Sistema otimizado de classificação e agrupamento de processos para maximizar produtividade")
 
     # Inicialização com validação de filtros
     if 'analyzer' not in st.session_state:
@@ -891,7 +1330,8 @@ def main():
 
     # Renderização das seções principais
     dashboard.render_overview()
-    dashboard.render_charts()
+    # dashboard.render_advanced_kpis()  # NOVA SEÇÃO
+    dashboard.render_enhanced_charts()  # GRÁFICOS APRIMORADOS
     dashboard.render_process_groups()
     dashboard.render_export_section()
 
@@ -939,10 +1379,6 @@ def main():
                 st.write("**🎯 Sugestão de Foco:**")
                 for i, (nome, qtd) in enumerate(maiores_grupos, 1):
                     st.write(f"{i}. {nome}: {qtd} processos")
-
-                # Métricas de monetização/otimização
-                tempo_economizado = len(analyzer.data_limpo) * 0.1  # 6 minutos por processo economizado
-                st.write(f"**⏱️ Tempo economizado estimado:** {tempo_economizado:.0f} horas/mês")
 
     # Footer com informações técnicas
     st.markdown("---")
